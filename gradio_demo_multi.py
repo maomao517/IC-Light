@@ -19,19 +19,21 @@ from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
 import torch.multiprocessing as mp
+import argparse
 
 
-
-#declare some path
 BG_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/bgs/"
 FG_DIR="/home/notebook/code/personal/S9059881/batch-face/images/white_yellow_xxx_thr0.9_bsz32/"
 OUTPUT_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/output/"
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
-#set the standard size
+
 IMG_WIDTH = 1024
 IMG_HEIGHT = 1024
-
+#使用方法：python gradio_demo_multi.py --gpu 0
+parser = argparse.ArgumentParser()
+parser.add_argument("--gpu", type=int, required=True, help='gpu number to be used')
+args = parser.parse_args()
 
 def initialize_pipelines(device, model_path=None):
     """
@@ -547,6 +549,7 @@ def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
         bg_paths.extend(glob.glob(os.path.join(BG_DIR,ext)))
     if not fg_paths or not bg_paths:
         logging.error("No input image found, please add more samploe images.")
+
     # 分配任务
     fg_paths = fg_paths[part::n_parts]
     logging.info(f"gpu{gpu}:load {len(fg_paths)}foreground images({part}/{n_parts})")
@@ -560,15 +563,16 @@ def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
 
     for fg_path in fg_paths:
         fg_name = os.path.splitext(os.path.basename(fg_path))[0]
-        # for bg_path in bg_paths:
-        #     bg_name = os.path.splitext(os.path.basename(bg_path))[0]
+
         input_fg = np.array(Image.open(fg_path).convert("RGB"))#转换为np数组
         select_prompts = random.sample(self_prompts,k=10)
+
         for j,me_prompt in enumerate(select_prompts):
-        # for light_dir in LIGHT_DIRECTION:
             light_dir = random.choice(list(BGSource))
             output_name = f"{fg_name}_relight_{light_dir.value}_prompt{me_prompt}.png"
             output_path=os.path.join(OUTPUT_DIR,output_name)
+            # 这里是t2i，所以不需要传背景图片
+            # 由于修改成了多卡推理，所以传入了很多模型
             output_fg,results = process_relight(
                 input_fg=input_fg,  # 前景图片的 numpy 数组
                 prompt=me_prompt,  # Prompt 文本
@@ -594,85 +598,32 @@ def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
                 bg_source=light_dir.value,
             )
             if len(results) > 0:
-                # images=convert_to_image(results[0])
                 Image.fromarray(results[0]).save(output_path)
                 success_count+=1
             else :
                 print("error happens")
                 return
             progress.update(1)
-    # result=[fg_path,"sunshine from window",light_dir,IMG_WIDTH,IMG_HEIGHT,seed,output_path]
     progress.close()
     logging.info(f"GPU {gpu}: Progress completed. {success_count}/{total_pairs} pairs succeeded.")
     logging.info(f"Results are saved in {OUTPUT_DIR}")
 
-# 主函数
 def main():
-    """主流程：加载模型并批量处理图片"""
     logging.info("Starting iclight image relighting batch processing...")
     gpu_size = torch.cuda.device_count()
     logging.info(f"Using {gpu_size} GPUS for processing...")
 
     # 按 GPU 分片任务
     n_parts = gpu_size
-    gpu = 7
+    # 使用tmux开多个窗口，实现多卡推理
+    gpu = args.gpu
     generate_images(
         seed=12345,
         gpu=gpu,
         part=gpu,
         n_parts=n_parts,
     )
-    # gpu = 1
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 2
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 3
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 4
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 5
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 6
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
-    # gpu = 7
-    # generate_images(
-    #     seed=12345,
-    #     gpu=gpu,
-    #     part=gpu,
-    #     n_parts=n_parts,
-    # )
     
-    # mp.spawn(run_generate_images,args = [gpu_size, seed], nprocs=gpu_size, join=True)
     logging.info("All tasks completed.")
 
 
