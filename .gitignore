@@ -162,4 +162,9 @@ cython_debug/
 .idea/
 
 models/
-imgs/
+imgs/fgs/
+imgs/output/
+imgs/bgs/
+imgs/masks/
+imgs/envs/
+imgs/prompts-ly/
