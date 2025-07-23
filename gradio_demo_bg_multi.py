@@ -18,18 +18,18 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
-import torch.multiprocessing as mp
 import argparse
 
-
+#declare some path
 BG_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/bgs/"
 FG_DIR="/home/notebook/code/personal/S9059881/batch-face/images/white_yellow_xxx_thr0.9_bsz32/"
-OUTPUT_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/output/"
+OUTPUT_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/output_bg3/"
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
+#set the standard size
+IMG_WIDTH = 512
+IMG_HEIGHT =640
 
-IMG_WIDTH = 1024
-IMG_HEIGHT = 1024
 
 #使用方法：python gradio_demo_multi.py --gpu 0
 parser = argparse.ArgumentParser()
@@ -37,95 +37,82 @@ parser.add_argument("--gpu", type=int, required=True, help='gpu number to be use
 args = parser.parse_args()
 
 def initialize_pipelines(device, model_path=None):
-    """
-    初始化 Stable Diffusion 文本到图像和图像到图像管道
-    
-    参数:
-        device: torch.device - 使用的设备 (cuda 或 cpu)
-        model_path: str - IC-Light 模型的路径 (可选)
-    
-    返回:
-        t2i_pipe: StableDiffusionPipeline - 文本到图像管道
-        i2i_pipe: StableDiffusionImg2ImgPipeline - 图像到图像管道
-    """
-    # 1. 加载基础模型
+    # 'stablediffusionapi/realistic-vision-v51'
+    # 'runwayml/stable-diffusion-v1-5'
     sd15_name = 'stablediffusionapi/realistic-vision-v51'
-    
-    tokenizer = CLIPTokenizer.from_pretrained(
-        sd15_name, 
-        subfolder="tokenizer"
-    )
-    
-    text_encoder = CLIPTextModel.from_pretrained(
-        sd15_name, 
-        subfolder="text_encoder"
-    )
-    
-    vae = AutoencoderKL.from_pretrained(
-        sd15_name, 
-        subfolder="vae"
-    )
-    
-    unet = UNet2DConditionModel.from_pretrained(
-        sd15_name, 
-        subfolder="unet"
-    )
-    
-    # 2. 修改 UNet 结构
+    tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
+    vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
+    unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
+    rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
+
+
+
+    # Change UNet
+
     with torch.no_grad():
-        new_conv_in = torch.nn.Conv2d(
-            8, 
-            unet.conv_in.out_channels, 
-            unet.conv_in.kernel_size, 
-            unet.conv_in.stride, 
-            unet.conv_in.padding
-        )
+        new_conv_in = torch.nn.Conv2d(12, unet.conv_in.out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding)
         new_conv_in.weight.zero_()
         new_conv_in.weight[:, :4, :, :].copy_(unet.conv_in.weight)
         new_conv_in.bias = unet.conv_in.bias
         unet.conv_in = new_conv_in
-    
-    # 保存原始 forward 方法并创建 hook
+
     unet_original_forward = unet.forward
-    
+
+
     def hooked_unet_forward(sample, timestep, encoder_hidden_states, **kwargs):
         c_concat = kwargs['cross_attention_kwargs']['concat_conds'].to(sample)
         c_concat = torch.cat([c_concat] * (sample.shape[0] // c_concat.shape[0]), dim=0)
         new_sample = torch.cat([sample, c_concat], dim=1)
         kwargs['cross_attention_kwargs'] = {}
         return unet_original_forward(new_sample, timestep, encoder_hidden_states, **kwargs)
-    
+
+
     unet.forward = hooked_unet_forward
-    
-    # 3. 加载 IC-Light 模型
+
+    # Load
     if not model_path:
-        model_path = '/home/notebook/code/personal/S9059881/IC-Light/models/iclight_sd15_fc.safetensors'
-    
+        model_path = '/home/notebook/code/personal/S9059881/IC-Light/models/iclight_sd15_fbc.safetensors'
+    # use "wget https://hf-mirror.com/lllyasviel/ic-light/resolve/main/iclight_sd15_fbc.safetensors" to replace the download_url_to_path
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"IC-Light model not found at {model_path}")
-    
+        raise RuntimeError(f"模型未下载到{model_path}路径")
     sd_offset = sf.load_file(model_path)
     sd_origin = unet.state_dict()
+    keys = sd_origin.keys()
     sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
     unet.load_state_dict(sd_merged, strict=True)
-    
-    # 清理内存
-    del sd_offset, sd_origin, sd_merged
-    
-    # 4. 设置设备并加载模型到设备
+    del sd_offset, sd_origin, sd_merged, keys
+
+    # Device
     text_encoder = text_encoder.to(device=device, dtype=torch.float16)
     vae = vae.to(device=device, dtype=torch.bfloat16)
     unet = unet.to(device=device, dtype=torch.float16)
-    
-    # 5. 加载背景移除模型
-    rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
     rmbg = rmbg.to(device=device, dtype=torch.float32)
-    
-    # 6. 使用 SDP 注意力机制
+
+    # SDP
+
     unet.set_attn_processor(AttnProcessor2_0())
     vae.set_attn_processor(AttnProcessor2_0())
-    
-    # 7. 初始化调度器
+
+    # Samplers
+
+    ddim_scheduler = DDIMScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.00085,
+        beta_end=0.012,
+        beta_schedule="scaled_linear",
+        clip_sample=False,
+        set_alpha_to_one=False,
+        steps_offset=1,
+    )
+
+    euler_a_scheduler = EulerAncestralDiscreteScheduler(
+        num_train_timesteps=1000,
+        beta_start=0.00085,
+        beta_end=0.012,
+        steps_offset=1
+    )
+
     dpmpp_2m_sde_karras_scheduler = DPMSolverMultistepScheduler(
         num_train_timesteps=1000,
         beta_start=0.00085,
@@ -134,8 +121,9 @@ def initialize_pipelines(device, model_path=None):
         use_karras_sigmas=True,
         steps_offset=1
     )
-    
-    # 8. 创建管道
+
+    # Pipelines
+
     t2i_pipe = StableDiffusionPipeline(
         vae=vae,
         text_encoder=text_encoder,
@@ -159,10 +147,7 @@ def initialize_pipelines(device, model_path=None):
         feature_extractor=None,
         image_encoder=None
     )
-    
-    # 9. 返回管道和背景移除模型
     return t2i_pipe, i2i_pipe, rmbg, vae, tokenizer, text_encoder, unet
-
 
 @torch.inference_mode()
 def encode_prompt_inner(txt: str, tokenizer, device, text_encoder):
@@ -188,7 +173,7 @@ def encode_prompt_inner(txt: str, tokenizer, device, text_encoder):
 @torch.inference_mode()
 def encode_prompt_pair(positive_prompt, negative_prompt, tokenizer, device, text_encoder):
     c = encode_prompt_inner(positive_prompt, tokenizer, device, text_encoder)
-    uc = encode_prompt_inner(negative_prompt, tokenizer, device, text_encoder)
+    uc = encode_prompt_inner(negative_prompt,  tokenizer, device, text_encoder)
 
     c_len = float(len(c))
     uc_len = float(len(uc))
@@ -267,71 +252,56 @@ def run_rmbg(rmbg, device, img, sigma=0.0):
 
 
 @torch.inference_mode()
-def process(input_fg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source):
+def process(input_fg, input_bg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
     bg_source = BGSource(bg_source)
-    input_bg = None
 
-    if bg_source == BGSource.NONE:
+    if bg_source == BGSource.UPLOAD:
         pass
+    elif bg_source == BGSource.UPLOAD_FLIP:
+        input_bg = np.fliplr(input_bg)
+    elif bg_source == BGSource.GREY:
+        input_bg = np.zeros(shape=(image_height, image_width, 3), dtype=np.uint8) + 64
     elif bg_source == BGSource.LEFT:
-        gradient = np.linspace(255, 0, image_width)
+        gradient = np.linspace(224, 32, image_width)
         image = np.tile(gradient, (image_height, 1))
         input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
     elif bg_source == BGSource.RIGHT:
-        gradient = np.linspace(0, 255, image_width)
+        gradient = np.linspace(32, 224, image_width)
         image = np.tile(gradient, (image_height, 1))
         input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
     elif bg_source == BGSource.TOP:
-        gradient = np.linspace(255, 0, image_height)[:, None]
+        gradient = np.linspace(224, 32, image_height)[:, None]
         image = np.tile(gradient, (1, image_width))
         input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
     elif bg_source == BGSource.BOTTOM:
-        gradient = np.linspace(0, 255, image_height)[:, None]
+        gradient = np.linspace(32, 224, image_height)[:, None]
         image = np.tile(gradient, (1, image_width))
         input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
     else:
-        raise 'Wrong initial latent!'
+        raise 'Wrong background source!'
 
-    rng = torch.Generator(device=device).manual_seed(int(seed))
+    rng = torch.Generator(device=device).manual_seed(seed)
 
     fg = resize_and_center_crop(input_fg, image_width, image_height)
-
-    concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
+    bg = resize_and_center_crop(input_bg, image_width, image_height)
+    concat_conds = numpy2pytorch([fg, bg]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+    concat_conds = torch.cat([c[None, ...] for c in concat_conds], dim=1)
 
-    conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt , tokenizer = tokenizer, device=device , text_encoder=text_encoder)
+    conds, unconds = encode_prompt_pair(positive_prompt=prompt + ', ' + a_prompt, negative_prompt=n_prompt, tokenizer = tokenizer, device=device , text_encoder=text_encoder)
 
-    if input_bg is None:
-        latents = t2i_pipe(
-            prompt_embeds=conds,
-            negative_prompt_embeds=unconds,
-            width=image_width,
-            height=image_height,
-            num_inference_steps=steps,
-            num_images_per_prompt=num_samples,
-            generator=rng,
-            output_type='latent',
-            guidance_scale=cfg,
-            cross_attention_kwargs={'concat_conds': concat_conds},
-        ).images.to(vae.dtype) / vae.config.scaling_factor
-    else:
-        bg = resize_and_center_crop(input_bg, image_width, image_height)
-        bg_latent = numpy2pytorch([bg]).to(device=vae.device, dtype=vae.dtype)
-        bg_latent = vae.encode(bg_latent).latent_dist.mode() * vae.config.scaling_factor
-        latents = i2i_pipe(
-            image=bg_latent,
-            strength=lowres_denoise,
-            prompt_embeds=conds,
-            negative_prompt_embeds=unconds,
-            width=image_width,
-            height=image_height,
-            num_inference_steps=int(round(steps / lowres_denoise)),
-            num_images_per_prompt=num_samples,
-            generator=rng,
-            output_type='latent',
-            guidance_scale=cfg,
-            cross_attention_kwargs={'concat_conds': concat_conds},
-        ).images.to(vae.dtype) / vae.config.scaling_factor
+    latents = t2i_pipe(
+        prompt_embeds=conds,
+        negative_prompt_embeds=unconds,
+        width=image_width,
+        height=image_height,
+        num_inference_steps=steps,
+        num_images_per_prompt=num_samples,
+        generator=rng,
+        output_type='latent',
+        guidance_scale=cfg,
+        cross_attention_kwargs={'concat_conds': concat_conds},
+    ).images.to(vae.dtype) / vae.config.scaling_factor
 
     pixels = vae.decode(latents).sample
     pixels = pytorch2numpy(pixels)
@@ -346,10 +316,11 @@ def process(input_fg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_e
     latents = latents.to(device=unet.device, dtype=unet.dtype)
 
     image_height, image_width = latents.shape[2] * 8, latents.shape[3] * 8
-
     fg = resize_and_center_crop(input_fg, image_width, image_height)
-    concat_conds = numpy2pytorch([fg]).to(device=vae.device, dtype=vae.dtype)
+    bg = resize_and_center_crop(input_bg, image_width, image_height)
+    concat_conds = numpy2pytorch([fg, bg]).to(device=vae.device, dtype=vae.dtype)
     concat_conds = vae.encode(concat_conds).latent_dist.mode() * vae.config.scaling_factor
+    concat_conds = torch.cat([c[None, ...] for c in concat_conds], dim=1)
 
     latents = i2i_pipe(
         image=latents,
@@ -367,16 +338,17 @@ def process(input_fg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_e
     ).images.to(vae.dtype) / vae.config.scaling_factor
 
     pixels = vae.decode(latents).sample
-    outputs = pytorch2numpy(pixels)
-    return outputs
+    pixels = pytorch2numpy(pixels, quant=False)
+
+    return pixels, [fg, bg]
 
 
 @torch.inference_mode()
-def process_relight(input_fg, prompt, t2i_pipe, i2i_pipe, rmbg, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source):
+def process_relight(input_fg, input_bg, prompt, t2i_pipe, i2i_pipe, rmbg, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
     input_fg, matting = run_rmbg(rmbg, device, input_fg)
-    #生成的是去掉背景的前景图像
-    results = process(input_fg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source)
-    return input_fg, results
+    results, extra_images = process(input_fg, input_bg, prompt, t2i_pipe, i2i_pipe, device, vae, tokenizer, text_encoder, unet, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source)
+    results = [(x * 255.0).clip(0, 255).astype(np.uint8) for x in results]
+    return results + extra_images
 
 
 quick_prompts = [
@@ -408,113 +380,6 @@ quick_prompts = [
     'Under the stars, focusing on facial structures and natural reflections.',
 ]
 
-self_prompts = [
-    "detailed face and skin texture, Window sunlight",
-    "detailed face and skin texture, Ocean sunset",
-    "detailed face and skin texture, Golden hour glow", 
-    "detailed face and skin texture, Natural daylight",
-    "detailed face and skin texture, Cozy bedroom lighting",
-    "detailed face and skin texture, Window shadow patterns",
-    "detailed face and skin texture, Studio softbox lighting",
-    "detailed face and skin texture, Homey bedroom illumination",
-    "detailed face and skin texture, Dim jazz club lighting",
-    "detailed face and skin texture, Sunset fishing boat",
-    "detailed face and skin texture, Mediterranean beach light",
-    "detailed face and skin texture, Caribbean water reflections",
-    "detailed face and skin texture, Greek column sunlight",
-    "detailed face and skin texture, Amber yoga studio",
-    "detailed face and skin texture, Greenhouse light beams",
-    "detailed face and skin texture, Neon grid gradients",
-    "detailed face and skin texture, Pink lagoon sunset",
-    "detailed face and skin texture, Pixel cityscape",
-    "detailed face and skin texture, Sunlit curtain beams",
-    "detailed face and skin texture, Neon portrait studio",
-    "detailed face and skin texture, Snowy mountain sunlight",
-    "detailed face and skin texture, Tropical beach clarity",
-    "detailed face and skin texture, Bedside reading lamp",
-    "detailed face and skin texture, Golden ocean path",
-    "detailed face and skin texture, Fireplace glow",
-    "detailed face and skin texture, Urban neon intersection",
-    "detailed face and skin texture, Rooftop cocktail lights",
-    "detailed face and skin texture, Prairie midday sun",
-    "detailed face and skin texture, Vintage desk sunset",
-    "detailed face and skin texture, Sunlit library",
-    "detailed face and skin texture, Corporate meeting room",
-    "detailed face and skin texture, Flower meadow",
-    "detailed face and skin texture, Modern dining space",
-    "detailed face and skin texture, Traditional Chinese interior",
-    "detailed face and skin texture, Campus stadium",
-    "detailed face and skin texture, Rainy street reflections",
-    "detailed face and skin texture, Desert dusk silhouettes",
-    "detailed face and skin texture, Underground metro lighting",
-    "detailed face and skin texture, Morning fog forest",
-    "detailed face and skin texture, Industrial warehouse skylight",
-    "detailed face and skin texture, Greenhouse sunrise",
-    "detailed face and skin texture, Subway station fluorescence",
-    "detailed face and skin texture, Night market lanterns",
-    "detailed face and skin texture, Library reading lamps",
-    "detailed face and skin texture, Lighthouse beam rotation",
-    "detailed face and skin texture, Airport runway lights",
-    "detailed face and skin texture, Candlelit cathedral",
-    "detailed face and skin texture, Underwater coral glow"
-    # 新增暗光场景扩展 (52条)
-    "detailed face and skin texture, Blue hour city balcony",
-    "detailed face and skin texture, Midnight library desk lamp",
-    "detailed face and skin texture, Jazz bar spotlight contour",
-    "detailed face and skin texture, Candlelit dinner glow",
-    "detailed face and skin texture, Neon alleyway reflections",
-    "detailed face and skin texture, Theater marquee glow",
-    "detailed face and skin texture, Aquarium blue illumination",
-    "detailed face and skin texture, Fire escape stairwell light",
-    "detailed face and skin texture, Noir detective office",
-    "detailed face and skin texture, Subway platform fluorescence",
-    "detailed face and skin texture, Concert stage backlight",
-    "detailed face and skin texture, Rain-streaked car window",
-    "detailed face and skin texture, Observatory red light",
-    "detailed face and skin texture, Wine cellar ambiance",
-    "detailed face and skin texture, Art gallery accent light",
-    "detailed face and skin texture, Karaoke booth neon",
-    "detailed face and skin texture, Bakery display case",
-    "detailed face and skin texture, Vinyl record store",
-    "detailed face and skin texture, Darkroom safelight",
-    "detailed face and skin texture, Casino slot glow",
-    "detailed face and skin texture, Tattoo parlor sign",
-    "detailed face and skin texture, Night flower market",
-    "detailed face and skin texture, Rooftop pool edge",
-    "detailed face and skin texture, Bookstore nook lamp",
-    "detailed face and skin texture, Dashboard glow drive",
-    "detailed face and skin texture, Fridge light midnight",
-    "detailed face and skin texture, Phone screen illumination",
-    "detailed face and skin texture, Campfire ember light",
-    "detailed face and skin texture, Lightning flash moment",
-    "detailed face and skin texture, Police siren reflections",
-    "detailed face and skin texture, Fireworks burst light",
-    "detailed face and skin texture, Bioluminescent shore",
-    "detailed face and skin texture, Northern lights glow",
-    "detailed face and skin texture, Welding spark instant",
-    "detailed face and skin texture, Lighthouse beam pass",
-    "detailed face and skin texture, Hospital monitor",
-    "detailed face and skin texture, Dark ride lighting",
-    "detailed face and skin texture, Dive torch beam",
-    "detailed face and skin texture, Blacklight glow",
-    "detailed face and skin texture, Neon repair work",
-    "detailed face and skin texture, Concert wristband",
-    "detailed face and skin texture, Airplane cabin night",
-    "detailed face and skin texture, Photobooth flash",
-    "detailed face and skin texture, Mirror ball specks",
-    "detailed face and skin texture, Security camera",
-    "detailed face and skin texture, Elevator buttons",
-    "detailed face and skin texture, ATM screen glow",
-    "detailed face and skin texture, Vending machine",
-    "detailed face and skin texture, Night construction",
-    "detailed face and skin texture, Tokyo alley neon",
-    "detailed face and skin texture, Marrakech lanterns",
-    "detailed face and skin texture, Venetian mask shop",
-    "detailed face and skin texture, Parisian cabaret",
-    "detailed face and skin texture, Istanbul oil lamps",
-    "detailed face and skin texture, New Orleans jazz"
-]
-
 quick_prompts = [[x] for x in quick_prompts]
 
 
@@ -525,14 +390,14 @@ quick_subjects = [
 quick_subjects = [[x] for x in quick_subjects]
 
 class BGSource(Enum):
-    NONE = "None"
+    UPLOAD = "Use Background Image"
+    UPLOAD_FLIP = "Use Flipped Background Image"
     LEFT = "Left Light"
     RIGHT = "Right Light"
     TOP = "Top Light"
     BOTTOM = "Bottom Light"
+    GREY = "Ambient"
 
-# def run_generate_images(gpu, gpu_size, seed):
-#     generate_images(seed=seed, gpu=gpu, part=gpu, n_parts=gpu_size)
 
 def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
     device = torch.device(f'cuda:{gpu}')
@@ -544,39 +409,40 @@ def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
     bg_paths=[]
     for ext in fg_extensions:
         fg_paths.extend(glob.glob(os.path.join(FG_DIR,ext)))
-    fg_paths.sort()
-    
     for ext in bg_extensions:
         bg_paths.extend(glob.glob(os.path.join(BG_DIR,ext)))
     if not fg_paths or not bg_paths:
         logging.error("No input image found, please add more samploe images.")
-
+    logging.info(f"Found {len(fg_paths)} foreground images and {len(bg_paths)} background images")
+    
     # 分配任务
     fg_paths = fg_paths[part::n_parts]
     logging.info(f"gpu{gpu}:load {len(fg_paths)}foreground images({part}/{n_parts})")
+
     #处理单个照片的重光照
     success_count=0
-    LIGHT_DIRECTION=[BGSource.NONE,BGSource.LEFT,BGSource.RIGHT,BGSource.TOP,BGSource.BOTTOM]
-    
+    LIGHT_DIRECTION=[BGSource.UPLOAD, BGSource.UPLOAD_FLIP, BGSource.LEFT,BGSource.RIGHT,BGSource.TOP,BGSource.BOTTOM, BGSource.GREY]
     total_pairs= len(fg_paths)*10
     logging.info(f"Total {total_pairs} image pairs to process.")
-    progress = tqdm(total=total_pairs, desc=f"GPU {gpu}: Processing images")
+    progress = tqdm(total=total_pairs,desc="processing images")
 
     for fg_path in fg_paths:
         fg_name = os.path.splitext(os.path.basename(fg_path))[0]
-
+        # for bg_path in bg_paths:
+        #     bg_name = os.path.splitext(os.path.basename(bg_path))[0]
         input_fg = np.array(Image.open(fg_path).convert("RGB"))#转换为np数组
-        select_prompts = random.sample(self_prompts,k=10)
-
-        for j,me_prompt in enumerate(select_prompts):
-            light_dir = random.choice(list(BGSource))
-            output_name = f"{fg_name}_relight_{light_dir.value}_prompt{me_prompt}.png"
+        select_bg_paths = random.sample(bg_paths,k=10)
+        for bg_path in select_bg_paths:
+            input_bg = np.array(Image.open(bg_path).convert("RGB"))#转换为np数组
+            bg_name = os.path.splitext(os.path.basename(bg_path))[0]
+        # for light_dir in LIGHT_DIRECTION:
+            light_dir = BGSource.UPLOAD #默认使用背景图片
+            output_name = f"{fg_name}_relight_{light_dir.value}_{bg_name}.png"
             output_path=os.path.join(OUTPUT_DIR,output_name)
-            # 这里是t2i，所以不需要传背景图片
-            # 由于修改成了多卡推理，所以传入了很多模型
-            output_fg,results = process_relight(
+            results = process_relight(
                 input_fg=input_fg,  # 前景图片的 numpy 数组
-                prompt=me_prompt,  # Prompt 文本
+                input_bg=input_bg,
+                prompt="natural face, smooth skin, soft natural lighting, no overexposure, seamless blend with background",
                 t2i_pipe=t2i_pipe,
                 i2i_pipe=i2i_pipe,
                 rmbg=rmbg,
@@ -589,27 +455,30 @@ def generate_images(seed:int=12345, gpu:int=0, part:int=0, n_parts:int=1):
                 image_height=IMG_HEIGHT,
                 num_samples=1,
                 seed=seed,
-                steps=25,
-                a_prompt='best quality',
-                n_prompt='lowres, bad anatomy, bad hands, cropped, worst quality',
-                cfg=2,
-                highres_scale=1.5,
-                highres_denoise=0.5,
-                lowres_denoise=0.9,
+                steps=35,
+                a_prompt="best quality, soft shadows, balanced light, cinematic skin texture, subtle skin pores, natural oil sheen",  # 正向增强柔和光照
+                n_prompt="overexposed, bright spots, harsh light, grainy skin, wax figure, airbrushed skin, perfect skin",  # 排除过曝和硬光
+                cfg=3.2,
+                highres_scale=1.2,
+                highres_denoise=0.6,
                 bg_source=light_dir.value,
             )
             if len(results) > 0:
+                # images=convert_to_image(results[0])
                 Image.fromarray(results[0]).save(output_path)
                 success_count+=1
             else :
                 print("error happens")
                 return
             progress.update(1)
+
     progress.close()
-    logging.info(f"GPU {gpu}: Progress completed. {success_count}/{total_pairs} pairs succeeded.")
+    logging.info(f"Progress completed.{success_count}/{total_pairs}pairs succeed.")
     logging.info(f"Results are saved in {OUTPUT_DIR}")
 
+# 主函数
 def main():
+    """主流程：加载模型并批量处理图片"""
     logging.info("Starting iclight image relighting batch processing...")
     gpu_size = torch.cuda.device_count()
     logging.info(f"Using {gpu_size} GPUS for processing...")
@@ -624,10 +493,69 @@ def main():
         part=gpu,
         n_parts=n_parts,
     )
-    
     logging.info("All tasks completed.")
-
-
 
 if __name__ == "__main__":
     main()
+
+
+# block = gr.Blocks().queue()
+# with block:
+#     with gr.Row():
+#         gr.Markdown("## IC-Light (Relighting with Foreground and Background Condition)")
+#     with gr.Row():
+#         with gr.Column():
+#             with gr.Row():
+#                 input_fg = gr.Image(source='upload', type="numpy", label="Foreground", height=480)
+#                 input_bg = gr.Image(source='upload', type="numpy", label="Background", height=480)
+#             prompt = gr.Textbox(label="Prompt")
+#             bg_source = gr.Radio(choices=[e.value for e in BGSource],
+#                                  value=BGSource.UPLOAD.value,
+#                                  label="Background Source", type='value')
+
+#             example_prompts = gr.Dataset(samples=quick_prompts, label='Prompt Quick List', components=[prompt])
+#             bg_gallery = gr.Gallery(height=450, object_fit='contain', label='Background Quick List', value=db_examples.bg_samples, columns=5, allow_preview=False)
+#             relight_button = gr.Button(value="Relight")
+
+#             with gr.Group():
+#                 with gr.Row():
+#                     num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
+#                     seed = gr.Number(label="Seed", value=12345, precision=0)
+#                 with gr.Row():
+#                     image_width = gr.Slider(label="Image Width", minimum=256, maximum=1024, value=512, step=64)
+#                     image_height = gr.Slider(label="Image Height", minimum=256, maximum=1024, value=640, step=64)
+
+#             with gr.Accordion("Advanced options", open=False):
+#                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=20, step=1)
+#                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=7.0, step=0.01)
+#                 highres_scale = gr.Slider(label="Highres Scale", minimum=1.0, maximum=3.0, value=1.5, step=0.01)
+#                 highres_denoise = gr.Slider(label="Highres Denoise", minimum=0.1, maximum=0.9, value=0.5, step=0.01)
+#                 a_prompt = gr.Textbox(label="Added Prompt", value='best quality')
+#                 n_prompt = gr.Textbox(label="Negative Prompt",
+#                                       value='lowres, bad anatomy, bad hands, cropped, worst quality')
+#                 normal_button = gr.Button(value="Compute Normal (4x Slower)")
+#         with gr.Column():
+#             result_gallery = gr.Gallery(height=832, object_fit='contain', label='Outputs')
+#     with gr.Row():
+#         dummy_image_for_outputs = gr.Image(visible=False, label='Result')
+#         gr.Examples(
+#             fn=lambda *args: [args[-1]],
+#             examples=db_examples.background_conditioned_examples,
+#             inputs=[
+#                 input_fg, input_bg, prompt, bg_source, image_width, image_height, seed, dummy_image_for_outputs
+#             ],
+#             outputs=[result_gallery],
+#             run_on_click=True, examples_per_page=1024
+#         )
+#     ips = [input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source]
+#     relight_button.click(fn=process_relight, inputs=ips, outputs=[result_gallery])
+#     normal_button.click(fn=process_normal, inputs=ips, outputs=[result_gallery])
+#     example_prompts.click(lambda x: x[0], inputs=example_prompts, outputs=prompt, show_progress=False, queue=False)
+
+#     def bg_gallery_selected(gal, evt: gr.SelectData):
+#         return gal[evt.index]['name']
+
+#     bg_gallery.select(bg_gallery_selected, inputs=bg_gallery, outputs=input_bg)
+
+
+# block.launch(server_name='0.0.0.0')

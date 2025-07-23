@@ -1,11 +1,15 @@
 import os
+import logging
+import glob
+from tqdm import tqdm
 import math
+import random
 import gradio as gr
 import numpy as np
 import torch
 import safetensors.torch as sf
 import db_examples
-
+from huggingface_hub import hf_hub_download
 from PIL import Image
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
@@ -27,14 +31,13 @@ rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
 #declare some path
 BG_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/bgs/"
-FG_DIR="/home/notebook/code/personal/S9059881/batch-face/images/recover_imgs/"
-OUTPUT_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/output_bg/"
+FG_DIR="/home/notebook/code/personal/S9059881/batch-face/images/white_yellow_xxx_thr0.9_bsz32/"
+OUTPUT_DIR="/home/notebook/code/personal/S9059881/IC-Light/imgs/output_bg3/"
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 #set the standard size
-IMG_WIDTH = 1024
-IMG_HEIGHT = 1024
-
+IMG_WIDTH = 512
+IMG_HEIGHT =640
 
 # Change UNet
 
@@ -60,11 +63,10 @@ unet.forward = hooked_unet_forward
 
 # Load
 
-model_path = './models/iclight_sd15_fbc.safetensors'
-
+model_path = '/home/notebook/code/personal/S9059881/IC-Light/models/iclight_sd15_fbc.safetensors'
+# use "wget https://hf-mirror.com/lllyasviel/ic-light/resolve/main/iclight_sd15_fbc.safetensors" to replace the download_url_to_path
 if not os.path.exists(model_path):
-    download_url_to_file(url='https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fbc.safetensors', dst=model_path)
-
+    raise RuntimeError(f"模型未下载到{model_path}路径")
 sd_offset = sf.load_file(model_path)
 sd_origin = unet.state_dict()
 keys = sd_origin.keys()
@@ -342,67 +344,43 @@ def process_relight(input_fg, input_bg, prompt, image_width, image_height, num_s
     return results + extra_images
 
 
-@torch.inference_mode()
-def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg, sigma=16)
-
-    print('left ...')
-    left = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.LEFT.value)[0][0]
-
-    print('right ...')
-    right = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.RIGHT.value)[0][0]
-
-    print('bottom ...')
-    bottom = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.BOTTOM.value)[0][0]
-
-    print('top ...')
-    top = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.TOP.value)[0][0]
-
-    inner_results = [left * 2.0 - 1.0, right * 2.0 - 1.0, bottom * 2.0 - 1.0, top * 2.0 - 1.0]
-
-    ambient = (left + right + bottom + top) / 4.0
-    h, w, _ = ambient.shape
-    matting = resize_and_center_crop((matting[..., 0] * 255.0).clip(0, 255).astype(np.uint8), w, h).astype(np.float32)[..., None] / 255.0
-
-    def safa_divide(a, b):
-        e = 1e-5
-        return ((a + e) / (b + e)) - 1.0
-
-    left = safa_divide(left, ambient)
-    right = safa_divide(right, ambient)
-    bottom = safa_divide(bottom, ambient)
-    top = safa_divide(top, ambient)
-
-    u = (right - left) * 0.5
-    v = (top - bottom) * 0.5
-
-    sigma = 10.0
-    u = np.mean(u, axis=2)
-    v = np.mean(v, axis=2)
-    h = (1.0 - u ** 2.0 - v ** 2.0).clip(0, 1e5) ** (0.5 * sigma)
-    z = np.zeros_like(h)
-
-    normal = np.stack([u, v, h], axis=2)
-    normal /= np.sum(normal ** 2.0, axis=2, keepdims=True) ** 0.5
-    normal = normal * matting + np.stack([z, z, 1 - z], axis=2) * (1 - matting)
-
-    results = [normal, left, right, bottom, top] + inner_results
-    results = [(x * 127.5 + 127.5).clip(0, 255).astype(np.uint8) for x in results]
-    return results
-
-
 quick_prompts = [
-    'beautiful woman',
-    'handsome man',
-    'beautiful woman, cinematic lighting',
-    'handsome man, cinematic lighting',
-    'beautiful woman, natural lighting',
-    'handsome man, natural lighting',
-    'beautiful woman, neo punk lighting, cyberpunk',
-    'handsome man, neo punk lighting, cyberpunk',
+    'sunshine from window',
+    'neon light, city',
+    'sunset over sea',
+    'golden time',
+    'sci-fi RGB glowing, cyberpunk',
+    'natural lighting',
+    'warm atmosphere, at home, bedroom',
+    'magic lit',
+    'evil, gothic, Yharnam',
+    'light and shadow',
+    'shadow from window',
+    'soft studio lighting',
+    'home atmosphere, cozy bedroom illumination',
+    'neon, Wong Kar-wai, warm',
+    'Sunset over sea',
+    'Chicago jazz club with dim lights',
+    'An abstract, digital-art inspired backdrop',
+    'Bright, saturated, clear-sky scene, reflecting distinctive facial details.',
+    'Vibrant neon-lit night scene, neutralizing reflections on facial features.',
+    'Timeless, classic architectural backdrop, reflecting well-defined facial features.',
+    'Serene blue sea, capturing clear facial dimensions and reflections.',
+    'Warm, cozy room backdrop, resonating well-modeled facial attributes.',
+    'Snowy setting with crisp cold reflections, highlighting sharp facial features.',
+    'Contrast of vibrant rainforest canopy, presenting clear facial structure and reflections.',
+    'Energetic market ambiance, showcasing distinguished facial details.',
+    'Under the stars, focusing on facial structures and natural reflections.',
 ]
+
 quick_prompts = [[x] for x in quick_prompts]
 
+
+quick_subjects = [
+    'beautiful woman, detailed face',
+    'handsome man, detailed face',
+]
+quick_subjects = [[x] for x in quick_subjects]
 
 class BGSource(Enum):
     UPLOAD = "Use Background Image"
@@ -412,6 +390,7 @@ class BGSource(Enum):
     TOP = "Top Light"
     BOTTOM = "Bottom Light"
     GREY = "Ambient"
+
 
 def generate_images(seed:int=12345):
     result=[]
@@ -429,19 +408,10 @@ def generate_images(seed:int=12345):
     
     #处理单个照片的重光照
     success_count=0
-    LIGHT_DIRECTION=[BGSource.NONE,BGSource.LEFT,BGSource.RIGHT,BGSource.TOP,BGSource.BOTTOM]
-    
+    LIGHT_DIRECTION=[BGSource.UPLOAD, BGSource.UPLOAD_FLIP, BGSource.LEFT,BGSource.RIGHT,BGSource.TOP,BGSource.BOTTOM, BGSource.GREY]
     total_pairs= len(fg_paths)*10
     logging.info(f"Total {total_pairs} image pairs to process.")
     progress = tqdm(total=total_pairs,desc="processing images")
-
-    # for i, fg_path in enumerate(fg_paths[:2]):
-    # fg_path = "/home/notebook/code/personal/S9059881/IC-Light/imgs/fgs/i5.png"
-
-    #需要进行的下一步操作：
-    # 1.生成100个prompt 
-    # 2. 每个prompt选取三张图片进行生成 
-    # 3.计算每个图片的美学分数，存储在100*3的数组中，按列计算平均值，保留平均值大于threshold的prompts
 
     for fg_path in fg_paths:
         fg_name = os.path.splitext(os.path.basename(fg_path))[0]
@@ -453,23 +423,23 @@ def generate_images(seed:int=12345):
             input_bg = np.array(Image.open(bg_path).convert("RGB"))#转换为np数组
             bg_name = os.path.splitext(os.path.basename(bg_path))[0]
         # for light_dir in LIGHT_DIRECTION:
-            light_dir = random.choice(list(BGSource))
-            output_name = f"{fg_name}_relight_{light_dir.value}_bg{bg_name}.png"
+            light_dir = BGSource.UPLOAD #默认使用背景图片
+            output_name = f"{fg_name}_relight_{light_dir.value}_{bg_name}.png"
             output_path=os.path.join(OUTPUT_DIR,output_name)
-            output_fg,results = process_relight(
+            results = process_relight(
                 input_fg=input_fg,  # 前景图片的 numpy 数组
                 input_bg=input_bg,
-                prompt="detailed face and skin texture",  # Prompt 文本
+                prompt="natural face, smooth skin, soft natural lighting, no overexposure, seamless blend with background",
                 image_width=IMG_WIDTH,
                 image_height=IMG_HEIGHT,
                 num_samples=1,
                 seed=seed,
-                steps=20,
-                a_prompt='best quality',
-                n_prompt='lowres, bad anatomy, bad hands, cropped, worst quality',
-                cfg=7.0,
-                highres_scale=1.5,
-                highres_denoise=0.5,
+                steps=35,
+                a_prompt="best quality, soft shadows, balanced light, cinematic skin texture, subtle skin pores, natural oil sheen",  # 正向增强柔和光照
+                n_prompt="overexposed, bright spots, harsh light, grainy skin, wax figure, airbrushed skin, perfect skin",  # 排除过曝和硬光
+                cfg=3.2,
+                highres_scale=1.2,
+                highres_denoise=0.6,
                 bg_source=light_dir.value,
             )
             if len(results) > 0:
@@ -480,7 +450,7 @@ def generate_images(seed:int=12345):
                 print("error happens")
                 return
             progress.update(1)
-    # result=[fg_path,"sunshine from window",light_dir,IMG_WIDTH,IMG_HEIGHT,seed,output_path]
+
     progress.close()
     logging.info(f"Progress completed.{success_count}/{total_pairs}pairs succeed.")
     logging.info(f"Results are saved in {OUTPUT_DIR}")
@@ -495,9 +465,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 # block = gr.Blocks().queue()
